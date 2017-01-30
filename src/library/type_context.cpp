@@ -3259,7 +3259,8 @@ struct instance_synthesizer {
     }
 
     void cache_result(expr const & type, optional<expr> const & inst) {
-        m_ctx.m_cache->m_instance_cache.insert(mk_pair(type, inst));
+        if (!has_expr_metavar(type))
+            m_ctx.m_cache->m_instance_cache.insert(mk_pair(type, inst));
     }
 
     optional<expr> ensure_no_meta(optional<expr> r) {
@@ -3288,15 +3289,17 @@ struct instance_synthesizer {
 
     optional<expr> mk_class_instance_core(expr const & type) {
         /* We do not cache results when multiple instances have to be generated. */
-        auto it = m_ctx.m_cache->m_instance_cache.find(type);
-        if (it != m_ctx.m_cache->m_instance_cache.end()) {
-            /* instance/failure is already cached */
-            lean_trace("class_instances",
-                       if (it->second)
-                           tout() << "cached instance for " << type << "\n" << *(it->second) << "\n";
-                       else
-                           tout() << "cached failure for " << type << "\n";);
-            return it->second;
+        if (!has_expr_metavar(type)) {
+            auto it = m_ctx.m_cache->m_instance_cache.find(type);
+            if (it != m_ctx.m_cache->m_instance_cache.end()) {
+                /* instance/failure is already cached */
+                lean_trace("class_instances",
+                           if (it->second)
+                               tout() << "cached instance for " << type << "\n" << *(it->second) << "\n";
+                           else
+                               tout() << "cached failure for " << type << "\n";);
+                return it->second;
+            }
         }
         m_state          = state();
         m_main_mvar      = m_ctx.mk_tmp_mvar(type);
@@ -3319,13 +3322,110 @@ struct instance_synthesizer {
     }
 };
 
+// TODO(Leo): cleanup and move to different file
+static bool is_out_param(expr const & type) {
+    return is_app_of(type, "out_param", 1);
+}
+
+// TODO(Leo): cleanup and move to different file
+static bool is_inout_param(expr const & type) {
+    return is_app_of(type, "inout_param", 1);
+}
+
+static bool depends_on_mvar(expr const & e, buffer<expr> const & mvars) {
+    // TODO(Leo): improve performance if needed
+    for (expr const & mvar : mvars) {
+        if (occurs(mvar, e))
+            return true;
+    }
+    return false;
+}
+
+/*
+Type class parameters can be annotated with out_param and inout_param annotations.
+
+Given (C a_1 ... a_n), we replace a_i with a temporary metavariable ?m_i IF
+1- a_i is an out_param
+2- a_i is an inout_param and it contains metavariables.
+3- a_i depends on a_j for j < i, and a_j was replaced with a temporary metavariable ?m_j.
+   This case is needed to make sure the new C-application is type correct.
+
+Then, we execute type class resolution as usual.
+If it succeeds, and metavariables ?m_i have been assigned, we solve the unification
+constraints ?m_i =?= a_i. If we succeed, we return the result. Otherwise, we fail.
+
+We store the pairs (a_i, m_i) in the buffer replacements.
+*/
+expr type_context::preprocess_class(expr const & type, buffer<expr_pair> & replacements) {
+    if (!has_expr_metavar(type))
+        return type;
+    type_context::tmp_locals locals(*this);
+    expr it = type;
+    while (true) {
+        expr new_it = relaxed_whnf(it);
+        if (!is_pi(new_it))
+            break;
+        expr local  = locals.push_local_from_binding(new_it);
+        it          = instantiate(binding_body(new_it), local);
+    }
+    buffer<expr> C_args;
+    buffer<expr> new_mvars;
+    expr C = get_app_args(it, C_args);
+    if (!is_constant(C) || !constant_is_class(C))
+        return type;
+    expr it2 = infer(C);
+    for (expr & C_arg : C_args) {
+        it2  = relaxed_whnf(it2);
+        if (!is_pi(it2))
+            return type; /* failed */
+        expr const & d = binding_domain(it2);
+        if ((is_inout_param(d) && has_expr_metavar(C_arg)) ||
+            (is_out_param(d)) ||
+            (depends_on_mvar(d, new_mvars))) {
+            expr new_mvar = mk_tmp_mvar(locals.mk_pi(d));
+            expr new_arg  = mk_app(new_mvar, locals.as_buffer());
+            replacements.emplace_back(C_arg, new_arg);
+            C_arg = new_arg;
+        }
+        it2 = instantiate(binding_body(it2), C_arg);
+    }
+    expr new_class = mk_app(C, C_args);
+    return locals.mk_pi(new_class);
+}
+
 optional<expr> type_context::mk_class_instance(expr const & type) {
+    optional<expr> result;
+    buffer<expr_pair> replacements;
     if (in_tmp_mode()) {
-        return instance_synthesizer(*this)(type);
+        expr new_type = preprocess_class(type, replacements);
+        result        = instance_synthesizer(*this)(new_type);
+        if (result) {
+            for (expr_pair & p : replacements) {
+                p.second = instantiate_mvars(p.second);
+            }
+        }
     } else {
         tmp_mode_scope s(*this);
-        return instance_synthesizer(*this)(type);
+        expr new_type = preprocess_class(type, replacements);
+        result        = instance_synthesizer(*this)(new_type);
+        if (result) {
+            for (expr_pair & p : replacements) {
+                p.second = instantiate_mvars(p.second);
+            }
+        }
     }
+    if (result) {
+        scope S(*this);
+        for (expr_pair & p : replacements) {
+            if (has_expr_metavar(p.second))
+                return none_expr();
+            if (!is_def_eq_core(p.first, p.second)) {
+                return none_expr();
+            }
+        }
+        S.commit();
+    }
+    return result;
 }
 
 optional<expr> type_context::mk_subsingleton_instance(expr const & type) {
@@ -3338,7 +3438,7 @@ optional<expr> type_context::mk_subsingleton_instance(expr const & type) {
         return none_expr();
     }
     level lvl    = sort_level(Type);
-    expr subsingleton =mk_app(mk_constant(get_subsingleton_name(), {lvl}), type);
+    expr subsingleton = mk_app(mk_constant(get_subsingleton_name(), {lvl}), type);
     auto r = mk_class_instance(subsingleton);
     m_cache->m_subsingleton_cache.insert(mk_pair(type, r));
     return r;

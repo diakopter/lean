@@ -633,6 +633,7 @@ private:
     optional<name> constant_is_class(expr const & e);
     optional<name> is_full_class(expr type);
     lbool is_quick_class(expr const & type, name & result);
+    expr preprocess_class(expr const & type, buffer<expr_pair> & replacements);
 
 public:
     /* Helper class for creating pushing local declarations into the local context m_lctx */
